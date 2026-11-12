@@ -50,7 +50,7 @@ enum : UINT {
 
 enum : UINT {
     ID_PAUSE = 1, ID_D0, ID_D1, ID_D2, ID_GARL, ID_BALLS, ID_PLOW, ID_PLOWNOW,
-    ID_SHAKE, ID_CLEARBALLS, ID_FPS30, ID_PFS, ID_AUTO, ID_EXIT, ID_M0, ID_M1, ID_M2,
+    ID_SHAKE, ID_CLEARBALLS, ID_FPS30, ID_PFS, ID_AUTO, ID_EXIT, ID_M0, ID_M1, ID_M2, ID_WIDGETS,
 };
 
 struct Settings {
@@ -61,6 +61,7 @@ struct Settings {
     bool fps30 = false;
     bool pauseFullscreen = true;
     bool paused = false;
+    bool widgets = true;         // сугробы на виджетах Rainmeter
     int  maxMode = 1;            // развёрнутое окно: 0 обычный снег, 1 меньше, 2 без снега
 };
 
@@ -84,6 +85,7 @@ struct Gfx {
 struct Surface {
     RECT rc{};
     bool taskbar = false;
+    bool widget = false;                        // виджет Rainmeter: без гирлянд
     bool init = false;
     bool alive = false;
     bool dirty = true;
@@ -120,7 +122,7 @@ struct Plow {
     float cooldown = 40.0f;
 };
 
-struct WinInfo { HWND h; RECT rc; bool surface; bool taskbar; };
+struct WinInfo { HWND h; RECT rc; bool surface; bool taskbar; bool widget; };
 
 static HINSTANCE g_inst;
 static HWND g_overlay, g_msgWnd;
@@ -197,6 +199,7 @@ static void LoadSettings() {
     g_set.fps30 = RegReadDword(L"Fps30", 0) != 0;
     g_set.pauseFullscreen = RegReadDword(L"PauseFullscreen", 1) != 0;
     g_set.maxMode = (int)std::min<DWORD>(2, RegReadDword(L"MaxMode", 1));
+    g_set.widgets = RegReadDword(L"Widgets", 1) != 0;
 }
 static void SaveSettings() {
     RegWriteDword(L"Density", (DWORD)g_set.density);
@@ -206,6 +209,7 @@ static void SaveSettings() {
     RegWriteDword(L"Fps30", g_set.fps30);
     RegWriteDword(L"PauseFullscreen", g_set.pauseFullscreen);
     RegWriteDword(L"MaxMode", (DWORD)g_set.maxMode);
+    RegWriteDword(L"Widgets", g_set.widgets);
 }
 static bool AutostartEnabled() {
     DWORD sz = 0;
@@ -431,23 +435,33 @@ static BOOL CALLBACK EnumProc(HWND h, LPARAM) {
     DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
     if (cloaked) return TRUE;
     LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
-    if (ex & WS_EX_TRANSPARENT) return TRUE;
-    if (ex & WS_EX_LAYERED) {
-        BYTE a = 255; DWORD fl = 0; COLORREF key = 0;
-        if (GetLayeredWindowAttributes(h, &key, &a, &fl) && (fl & LWA_ALPHA) && a == 0) return TRUE;
+    wchar_t cls[64] = L"";
+    GetClassNameW(h, cls, 64);
+    // Виджеты Rainmeter — это окна-инструменты без заголовка, часто «прозрачные» для кликов
+    const bool widget = g_set.widgets && !wcscmp(cls, L"RainmeterMeterWindow");
+    if (!widget) {
+        if (ex & WS_EX_TRANSPARENT) return TRUE;
+        if (ex & WS_EX_LAYERED) {
+            BYTE a = 255; DWORD fl = 0; COLORREF key = 0;
+            if (GetLayeredWindowAttributes(h, &key, &a, &fl) && (fl & LWA_ALPHA) && a == 0) return TRUE;
+        }
     }
     RECT rc;
     if (FAILED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &rc, sizeof(rc))))
         if (!GetWindowRect(h, &rc)) return TRUE;
     int w = rc.right - rc.left, ht = rc.bottom - rc.top;
     if (w < 8 || ht < 8) return TRUE;
-    wchar_t cls[64] = L"";
-    GetClassNameW(h, cls, 64);
     if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW")) return TRUE;
 
-    WinInfo wi{h, rc, false, false};
+    WinInfo wi{h, rc, false, false, false};
     if (!wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Shell_SecondaryTrayWnd")) {
         wi.surface = wi.taskbar = true;
+    } else if (widget) {
+        MONITORINFO mi{sizeof(mi)};
+        if (w >= (int)(50 * g_scale) && ht >= (int)(20 * g_scale) &&
+            GetMonitorInfoW(MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST), &mi) &&
+            rc.top > mi.rcMonitor.top + (int)(6 * g_scale))
+            wi.surface = wi.widget = true;
     } else {
         wchar_t title[4];
         bool app = !(ex & WS_EX_TOOLWINDOW) && !(ex & WS_EX_NOACTIVATE) &&
@@ -491,6 +505,7 @@ static void Rescan() {
             if (s.init) Shed(s);
             s.rc = w.rc;
             s.taskbar = w.taskbar;
+            s.widget = w.widget;
             int cols = (int)((float)(w.rc.right - w.rc.left) / g_cw) + 1;
             s.h.assign((size_t)std::max(1, cols), 0.0f);
             if (!s.init) s.seed = Frand(0.0f, 100.0f);
@@ -948,7 +963,7 @@ static void DrawGarlands() {
     const float span = 66.0f * g_scale, sag = 7.0f * g_scale;
     const float t = (float)g_time;
     for (auto& sg : g_segs) {
-        if (sg.s->taskbar) continue;
+        if (sg.s->taskbar || sg.s->widget) continue;
         float len = sg.x1 - sg.x0;
         if (len < 110.0f * g_scale) continue;
         int ns = std::max(1, (int)(len / span + 0.5f));
@@ -1258,6 +1273,7 @@ static void ShowMenu() {
     AppendMenuW(m, MF_POPUP, (UINT_PTR)d, L"Количество снега");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)mm, L"Когда окно развёрнуто на весь экран");
     Item(m, ID_GARL, L"Гирлянды на окнах", g_set.garlands);
+    Item(m, ID_WIDGETS, L"Снег на виджетах Rainmeter", g_set.widgets);
     Item(m, ID_BALLS, L"Снежки: катать мышкой из сугроба", g_set.balls);
     Item(m, ID_PLOW, L"Снегоуборщик", g_set.plow);
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -1285,6 +1301,7 @@ static void ShowMenu() {
     case ID_D0: case ID_D1: case ID_D2: g_set.density = (int)(cmd - ID_D0); InitFlakes(); break;
     case ID_GARL: g_set.garlands = !g_set.garlands; break;
     case ID_BALLS: g_set.balls = !g_set.balls; break;
+    case ID_WIDGETS: g_set.widgets = !g_set.widgets; g_scanTimer = 0; break;
     case ID_M0: case ID_M1: case ID_M2: g_set.maxMode = (int)(cmd - ID_M0); UpdateActive(); break;
     case ID_PLOW: g_set.plow = !g_set.plow; break;
     case ID_PLOWNOW: StartPlow(); break;
