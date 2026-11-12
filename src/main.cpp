@@ -149,6 +149,7 @@ static Plow g_plow;
 static std::vector<RECT> g_covered;         // мониторы, занятые развёрнутым окном
 static std::vector<HMONITOR> g_coveredMon;
 static bool g_allCovered = false;
+static bool g_taskView = false;             // открыто переключение окон: только падающий снег
 static int g_dragIdx = -1;
 static float g_grabDx = 0, g_grabDy = 0;
 static int g_hoverIdx = -1;
@@ -508,6 +509,7 @@ static void Rescan() {
         segs.erase(std::remove_if(segs.begin(), segs.end(),
                                   [&](const std::pair<int, int>& p) { return p.second - p.first < minLen; }),
                    segs.end());
+        if (g_taskView && !w.taskbar) segs.clear();     // окна сейчас показаны миниатюрами, сугробам лежать не на чем
         if (segs != s.segs) { s.segs = segs; s.dirty = true; }
     }
 
@@ -520,11 +522,45 @@ static void Rescan() {
             g_segs.push_back({(float)sg.first, (float)sg.second, (float)kv.second.rc.top, &kv.second});
 }
 
+static bool IsTaskViewClass(const wchar_t* cls) {
+    return !wcscmp(cls, L"XamlExplorerHostIslandWindow") ||      // Windows 11: «Представление задач», Alt+Tab
+           !wcscmp(cls, L"MultitaskingViewFrame") ||             // Windows 10
+           !wcscmp(cls, L"TaskSwitcherWnd") || !wcscmp(cls, L"ForegroundStaging");
+}
+
+static bool IsExplorerProcess(HWND h) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (!pid) return false;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return false;
+    wchar_t path[MAX_PATH];
+    DWORD n = MAX_PATH;
+    bool res = false;
+    if (QueryFullProcessImageNameW(proc, 0, path, &n)) {
+        const wchar_t* name = wcsrchr(path, L'\\');
+        res = _wcsicmp(name ? name + 1 : path, L"explorer.exe") == 0;
+    }
+    CloseHandle(proc);
+    return res;
+}
+
+// Окна самой оболочки Windows: рабочий стол, панель задач, переключение окон
 static bool IsShellClass(HWND h) {
     wchar_t cls[64] = L"";
     GetClassNameW(h, cls, 64);
-    return !wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") ||
-           !wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Shell_SecondaryTrayWnd");
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") ||
+        !wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Shell_SecondaryTrayWnd") || IsTaskViewClass(cls))
+        return true;
+    if (!wcscmp(cls, L"CabinetWClass") || !wcscmp(cls, L"ExploreWClass")) return false;   // обычные окна Проводника
+    return IsExplorerProcess(h);
+}
+
+static bool IsTaskView(HWND h) {
+    if (!h) return false;
+    wchar_t cls[64] = L"";
+    GetClassNameW(h, cls, 64);
+    return IsTaskViewClass(cls);
 }
 
 static bool ForegroundIsFullscreen() {
@@ -567,7 +603,7 @@ static void ScanCovered() {
     g_covered.clear();
     g_coveredMon.clear();
     g_allCovered = false;
-    if (g_set.maxMode == 0) return;
+    if (g_set.maxMode == 0 || IsTaskView(GetForegroundWindow())) return;
     EnumWindows(CoveredProc, 0);
     g_allCovered = !g_covered.empty() && (int)g_covered.size() >= GetSystemMetrics(SM_CMONITORS);
 }
@@ -635,12 +671,20 @@ static bool SnowHit(float px, float py, float pad) {
 
 static const size_t kMaxBodies = 12;
 
+static void OnReleaseDrag();
+
 static void UpdateBodies(float dt) {
     POINT cp{};
     GetCursorPos(&cp);
 
     if (!g_set.balls) {
         if (!g_bodies.empty()) { g_bodies.clear(); DropDrag(); }
+        g_hot = false; g_hoverIdx = -1;
+        SetHook(false);
+        return;
+    }
+    if (g_taskView) {                               // снежки замирают и прячутся
+        OnReleaseDrag();
         g_hot = false; g_hoverIdx = -1;
         SetHook(false);
         return;
@@ -762,6 +806,9 @@ static void OnGrab(int px, int py) {
     g_grabDy = (float)py - b.base;
     b.vx = b.vy = 0;
 }
+
+static void OnRelease();
+static void OnReleaseDrag() { OnRelease(); g_dragIdx = -1; g_dragging = false; }
 
 static void OnRelease() {
     if (g_dragIdx >= 0 && g_dragIdx < (int)g_bodies.size()) {
@@ -1034,8 +1081,9 @@ static void Render() {
 
     if (g_plow.active) DrawPlow(world);
 
-    for (int i = 0; i < (int)g_bodies.size(); ++i)
-        DrawBody(g_bodies[(size_t)i], i == g_hoverIdx);
+    if (!g_taskView)
+        for (int i = 0; i < (int)g_bodies.size(); ++i)
+            DrawBody(g_bodies[(size_t)i], i == g_hoverIdx);
 
     for (auto& p : g_parts) {
         Col(1, 1, 1, 0.9f * Clampf(p.life / p.maxLife * 1.6f, 0.0f, 1.0f));
@@ -1087,7 +1135,10 @@ static void Frame() {
     HWND fg = GetForegroundWindow();
     RECT fr{};
     if (fg) GetWindowRect(fg, &fr);
-    if (fg != g_lastFg || !EqualRect(&fr, &g_lastFgRc)) { g_lastFg = fg; g_lastFgRc = fr; g_scanTimer = 0; }
+    if (fg != g_lastFg || !EqualRect(&fr, &g_lastFgRc)) {
+        g_lastFg = fg; g_lastFgRc = fr; g_scanTimer = 0;
+        g_taskView = IsTaskView(fg);
+    }
     g_scanTimer -= dt;
     if (g_scanTimer <= 0) { g_scanTimer = 0.25f; Rescan(); }
 
