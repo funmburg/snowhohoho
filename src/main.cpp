@@ -383,9 +383,9 @@ static float MaxHeight(const Surface& s) { return (s.taskbar ? 22.0f : 13.0f) * 
 
 static float CapAt(const Surface& s, int j) {
     // предел высоты неровный: получаются мягкие бугры, на панели задач — целые намёты
-    float big = 0.5f + 0.5f * sinf(j * 0.045f + s.seed) * sinf(j * 0.017f + s.seed * 1.7f);
-    float small = 0.5f + 0.5f * sinf(j * 0.19f + s.seed * 3.1f);
-    float k = s.taskbar ? (0.48f + 0.40f * big + 0.12f * small) : (0.66f + 0.26f * big + 0.08f * small);
+    float mound = 0.5f + 0.5f * sinf(j * 0.045f + s.seed) * sinf(j * 0.017f + s.seed * 1.7f);
+    float ripple = 0.5f + 0.5f * sinf(j * 0.19f + s.seed * 3.1f);
+    float k = s.taskbar ? (0.48f + 0.40f * mound + 0.12f * ripple) : (0.66f + 0.26f * mound + 0.08f * ripple);
     return MaxHeight(s) * k;
 }
 
