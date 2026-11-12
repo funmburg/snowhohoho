@@ -20,6 +20,7 @@
 #include <d2d1_1.h>
 #include <d2d1_1helper.h>
 #include <dcomp.h>
+#include <dwrite.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -60,7 +61,7 @@ enum : UINT {
 
 enum : UINT {
     ID_PAUSE = 1, ID_D0, ID_D1, ID_D2, ID_GARL, ID_BALLS, ID_PLOW, ID_PLOWNOW,
-    ID_SHAKE, ID_CLEARBALLS, ID_FPS30, ID_PFS, ID_AUTO, ID_EXIT, ID_M0, ID_M1, ID_M2, ID_WIDGETS, ID_AUTOUPD, ID_CHECKUPD,
+    ID_SHAKE, ID_CLEARBALLS, ID_FPS30, ID_PFS, ID_AUTO, ID_EXIT, ID_M0, ID_M1, ID_M2, ID_WIDGETS, ID_AUTOUPD, ID_CHECKUPD, ID_WIND,
 };
 
 struct Settings {
@@ -71,6 +72,7 @@ struct Settings {
     bool fps30 = false;
     bool pauseFullscreen = true;
     bool paused = false;
+    int  windX = 0, windY = 0;   // ветер, -100..100: вправо и вниз — плюс
     bool autoUpdate = true;      // обновляться автоматически
     bool widgets = true;         // сугробы на виджетах Rainmeter
     int  maxMode = 1;            // развёрнутое окно: 0 обычный снег, 1 меньше, 2 без снега
@@ -91,6 +93,7 @@ struct Gfx {
     ComPtr<IDCompositionTarget>   dtarget;
     ComPtr<IDCompositionVisual>   visual;
     ComPtr<ID2D1SolidColorBrush>  brush;
+    ComPtr<ID2D1LinearGradientBrush> grad;      // заливка сугробов: белый верх, голубоватый низ
 };
 
 struct Surface {
@@ -215,6 +218,8 @@ static void LoadSettings() {
     g_set.maxMode = (int)std::min<DWORD>(2, RegReadDword(L"MaxMode", 1));
     g_set.widgets = RegReadDword(L"Widgets", 1) != 0;
     g_set.autoUpdate = RegReadDword(L"AutoUpdate", 1) != 0;
+    g_set.windX = (int)std::min<DWORD>(200, RegReadDword(L"WindX", 100)) - 100;
+    g_set.windY = (int)std::min<DWORD>(200, RegReadDword(L"WindY", 100)) - 100;
 }
 static void SaveSettings() {
     RegWriteDword(L"Density", (DWORD)g_set.density);
@@ -226,6 +231,8 @@ static void SaveSettings() {
     RegWriteDword(L"MaxMode", (DWORD)g_set.maxMode);
     RegWriteDword(L"Widgets", g_set.widgets);
     RegWriteDword(L"AutoUpdate", g_set.autoUpdate);
+    RegWriteDword(L"WindX", (DWORD)(g_set.windX + 100));
+    RegWriteDword(L"WindY", (DWORD)(g_set.windY + 100));
 }
 static bool AutostartEnabled() {
     DWORD sz = 0;
@@ -289,6 +296,18 @@ static bool CreateGfx(HWND hwnd, int w, int h) {
     G.dc->SetTarget(G.target.Get());
     G.dc->SetDpi(96.0f, 96.0f);
     if (FAILED(G.dc->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &G.brush))) return false;
+    {
+        ID2D1RenderTarget* rt = G.dc.Get();
+        D2D1_GRADIENT_STOP stops[3] = {
+            {0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f)},
+            {0.55f, D2D1::ColorF(0.95f, 0.98f, 1.0f, 1.0f)},
+            {1.0f, D2D1::ColorF(0.76f, 0.88f, 1.0f, 1.0f)}};
+        ComPtr<ID2D1GradientStopCollection> coll;
+        if (SUCCEEDED(rt->CreateGradientStopCollection(stops, 3, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &coll)))
+            rt->CreateLinearGradientBrush(
+                D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, 0), D2D1::Point2F(0, 1)),
+                D2D1::BrushProperties(), coll.Get(), &G.grad);
+    }
 
     if (FAILED(DCompositionCreateDevice(dxgiDev.Get(), IID_PPV_ARGS(&G.dcomp)))) return false;
     if (FAILED(G.dcomp->CreateTargetForHwnd(hwnd, TRUE, &G.dtarget))) return false;
@@ -360,17 +379,14 @@ static void Poof(float x, float y, int n, float power) {
 // Сугробы
 // ---------------------------------------------------------------------------
 
-static float MaxHeight(const Surface& s) { return (s.taskbar ? 16.0f : 10.0f) * g_scale; }
+static float MaxHeight(const Surface& s) { return (s.taskbar ? 22.0f : 13.0f) * g_scale; }
 
 static float CapAt(const Surface& s, int j) {
-    int n = (int)s.h.size();
-    float cap = MaxHeight(s);
-    cap *= 0.78f + 0.22f * sinf(j * 0.071f + s.seed) * sinf(j * 0.023f + s.seed * 2.0f);
-    if (!s.taskbar) {
-        int edge = std::min(j, n - 1 - j);
-        cap *= std::min(1.0f, (edge + 0.5f) / 5.0f);     // закругление у углов окна
-    }
-    return cap;
+    // предел высоты неровный: получаются мягкие бугры, на панели задач — целые намёты
+    float big = 0.5f + 0.5f * sinf(j * 0.045f + s.seed) * sinf(j * 0.017f + s.seed * 1.7f);
+    float small = 0.5f + 0.5f * sinf(j * 0.19f + s.seed * 3.1f);
+    float k = s.taskbar ? (0.48f + 0.40f * big + 0.12f * small) : (0.66f + 0.26f * big + 0.08f * small);
+    return MaxHeight(s) * k;
 }
 
 static float HeightAt(const Surface& s, float x) {
@@ -425,10 +441,26 @@ static void BuildGeo(Surface& s) {
         float x0 = (float)sg.first, x1 = (float)sg.second;
         int c0 = std::max(0, std::min(n - 1, (int)((x0 - (float)s.rc.left) / g_cw)));
         int c1 = std::max(0, std::min(n - 1, (int)((x1 - (float)s.rc.left) / g_cw)));
+        // края шапки скругляем; у панели задач край экрана не трогаем
+        const float R = std::min((x1 - x0) * 0.5f, 12.0f * g_scale);
+        const bool roundL = !(s.taskbar && sg.first <= s.rc.left + 1);
+        const bool roundR = !(s.taskbar && sg.second >= s.rc.right - 1);
         pts.clear();
         for (int c = c0; c <= c1; ++c) {
+            float hv = 0, wsum = 0;
+            for (int k = -2; k <= 2; ++k) {                 // сглаживание — мягкий силуэт
+                int j = c + k;
+                if (j < 0 || j >= n) continue;
+                float w = 3.0f - fabsf((float)k);
+                hv += s.h[(size_t)j] * w;
+                wsum += w;
+            }
+            hv /= wsum;
             float x = Clampf((float)s.rc.left + (c + 0.5f) * g_cw, x0, x1);
-            pts.push_back(D2D1::Point2F(x, base - s.h[(size_t)c]));
+            float dl = x - x0, dr = x1 - x;
+            if (roundL && dl < R) { float t = 1.0f - dl / R; hv *= sqrtf(std::max(0.0f, 1.0f - t * t)); }
+            if (roundR && dr < R) { float t = 1.0f - dr / R; hv *= sqrtf(std::max(0.0f, 1.0f - t * t)); }
+            pts.push_back(D2D1::Point2F(x, base - hv));
         }
         pts.push_back(D2D1::Point2F(x1, base));
         sink->BeginFigure(D2D1::Point2F(x0, base), D2D1_FIGURE_BEGIN_FILLED);
@@ -925,13 +957,17 @@ static void UpdatePlow(float dt) {
 static void Update(float dt) {
     const float wind = (24.0f * sinf((float)g_time * 0.13f) + 12.0f * sinf((float)g_time * 0.41f + 1.3f)) * g_scale;
     const float vL = (float)g_vx, vR = (float)(g_vx + g_vw), vB = (float)(g_vy + g_vh);
+    // ветер из настроек: по горизонтали сносит, по вертикали ускоряет или придерживает падение
+    const float userWx = (float)g_set.windX * 0.01f * 320.0f * g_scale;
+    const float fallK = std::max(0.25f, 1.0f + (float)g_set.windY * 0.01f * 0.9f);
 
     for (auto& f : g_flakes) {
         float prevY = f.y;
         f.phase += f.phaseSpeed * dt;
-        f.x += (wind * (0.4f + 0.6f * f.alpha) + sinf(f.phase) * f.amp) * dt;
-        f.y += f.vy * dt;
+        f.x += ((wind + userWx) * (0.4f + 0.6f * f.alpha) + sinf(f.phase) * f.amp) * dt;
+        f.y += f.vy * fallK * dt;
         if (f.x < vL) f.x += (float)g_vw; else if (f.x >= vR) f.x -= (float)g_vw;
+        if (f.x < vL || f.x >= vR) f.x = Frand(vL, vR);
         if (f.y > vB + 6.0f) { SpawnFlake(f, false); continue; }
         float target = 1.0f;
         if (g_set.maxMode != 0 && !g_covered.empty()) {
@@ -947,7 +983,7 @@ static void Update(float dt) {
             if (f.x < sg.x0 || f.x > sg.x1) continue;
             float top = sg.y - HeightAt(*sg.s, f.x);
             if (prevY < top && f.y >= top) {
-                Deposit(*sg.s, f.x, 0.55f * f.r);
+                Deposit(*sg.s, f.x, 0.75f * f.r);
                 SpawnFlake(f, false);
                 break;
             }
@@ -1103,11 +1139,24 @@ static void Render() {
     if (g_set.garlands) DrawGarlands();
 
     // сугробы
-    Col(0.96f, 0.98f, 1.0f, 0.97f);
     for (auto& kv : g_surf) {
         Surface& s = kv.second;
         if (s.dirty && (g_time - s.lastBuild > 0.08 || !s.geo)) BuildGeo(s);
-        if (s.geo) G.dc->FillGeometry(s.geo.Get(), G.brush.Get());
+        if (!s.geo) continue;
+        const float top = (float)s.rc.top;
+        // мягкая голубая тень под шапкой
+        G.dc->SetTransform(D2D1::Matrix3x2F::Translation(0.0f, 2.0f * g_scale) * world);
+        Col(0.28f, 0.50f, 0.88f, 0.30f);
+        G.dc->FillGeometry(s.geo.Get(), G.brush.Get());
+        G.dc->SetTransform(world);
+        if (G.grad) {
+            G.grad->SetStartPoint(D2D1::Point2F(0.0f, top - MaxHeight(s)));
+            G.grad->SetEndPoint(D2D1::Point2F(0.0f, top + 1.0f));
+            G.dc->FillGeometry(s.geo.Get(), G.grad.Get());
+        } else {
+            Col(0.96f, 0.98f, 1.0f, 0.97f);
+            G.dc->FillGeometry(s.geo.Get(), G.brush.Get());
+        }
     }
 
     if (g_plow.active) DrawPlow(world);
@@ -1412,6 +1461,194 @@ static void OnUpdateResult(WPARAM result, bool manual) {
 }
 
 // ---------------------------------------------------------------------------
+// Панель ветра: тянешь стрелку от центра — задаёшь направление и силу
+// ---------------------------------------------------------------------------
+
+static HWND g_windWnd;
+static ComPtr<ID2D1Factory> g_pFactory;
+static ComPtr<IDWriteFactory> g_dw;
+static ComPtr<ID2D1HwndRenderTarget> g_prt;
+static ComPtr<ID2D1SolidColorBrush> g_pbrush;
+static ComPtr<IDWriteTextFormat> g_fmtBig, g_fmtSmall;
+static bool g_windDrag = false;
+
+struct WindLayout { float S, padL, padT, padSz, cx, cy, R, btnL, btnT, btnR, btnB, w, h; };
+static WindLayout WindLay() {
+    WindLayout L;
+    L.S = g_scale;
+    L.w = 280 * L.S; L.h = 356 * L.S;
+    L.padL = 20 * L.S; L.padT = 18 * L.S; L.padSz = 240 * L.S;
+    L.cx = L.padL + L.padSz * 0.5f; L.cy = L.padT + L.padSz * 0.5f;
+    L.R = 104 * L.S;
+    L.btnL = 90 * L.S; L.btnR = 190 * L.S; L.btnT = 314 * L.S; L.btnB = 342 * L.S;
+    return L;
+}
+
+static void WindSetFromPoint(float px, float py) {
+    WindLayout L = WindLay();
+    float vx = (px - L.cx) / L.R, vy = (py - L.cy) / L.R;
+    float len = sqrtf(vx * vx + vy * vy);
+    if (len > 1.0f) { vx /= len; vy /= len; }
+    if (len < 0.07f) { vx = vy = 0; }
+    g_set.windX = (int)lroundf(vx * 100.0f);
+    g_set.windY = (int)lroundf(vy * 100.0f);
+}
+
+static void WindPaint(HWND h) {
+    WindLayout L = WindLay();
+    if (!g_pFactory) D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_pFactory.GetAddressOf());
+    if (!g_dw) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                   reinterpret_cast<IUnknown**>(g_dw.GetAddressOf()));
+    if (!g_pFactory) return;
+    if (!g_prt) {
+        RECT rc; GetClientRect(h, &rc);
+        g_pFactory->CreateHwndRenderTarget(
+            D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(), 96.0f, 96.0f),
+            D2D1::HwndRenderTargetProperties(h, D2D1::SizeU((UINT32)rc.right, (UINT32)rc.bottom)), &g_prt);
+        if (!g_prt) return;
+        g_prt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &g_pbrush);
+        g_fmtBig.Reset(); g_fmtSmall.Reset();
+        if (g_dw) {
+            g_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+                                   DWRITE_FONT_STRETCH_NORMAL, 17.0f * L.S, L"ru-ru", &g_fmtBig);
+            g_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                   DWRITE_FONT_STRETCH_NORMAL, 11.5f * L.S, L"ru-ru", &g_fmtSmall);
+            for (IDWriteTextFormat* f : {g_fmtBig.Get(), g_fmtSmall.Get()})
+                if (f) { f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER); f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER); }
+        }
+    }
+    if (!g_pbrush) return;
+    ID2D1HwndRenderTarget* rt = g_prt.Get();
+    ID2D1SolidColorBrush* br = g_pbrush.Get();
+    auto col = [&](float r, float g, float b, float a = 1.0f) { br->SetColor(D2D1::ColorF(r, g, b, a)); };
+    const float S = L.S;
+
+    rt->BeginDraw();
+    rt->Clear(D2D1::ColorF(0.055f, 0.105f, 0.205f));
+    // поле
+    D2D1_ROUNDED_RECT pad = D2D1::RoundedRect(D2D1::RectF(L.padL, L.padT, L.padL + L.padSz, L.padT + L.padSz), 20 * S, 20 * S);
+    col(0.035f, 0.070f, 0.150f); rt->FillRoundedRectangle(pad, br);
+    col(0.22f, 0.52f, 1.0f); rt->DrawRoundedRectangle(pad, br, 2.0f * S);
+    col(0.45f, 0.65f, 1.0f, 0.22f);
+    for (int iy = -2; iy <= 2; ++iy)
+        for (int ix = -2; ix <= 2; ++ix)
+            rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(L.cx + ix * 44 * S, L.cy + iy * 44 * S), 1.6f * S, 1.6f * S), br);
+    col(0.22f, 0.52f, 1.0f, 0.25f);
+    rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(L.cx, L.cy), L.R, L.R), br, 1.0f * S);
+
+    // стрелка
+    float vx = (float)g_set.windX * 0.01f, vy = (float)g_set.windY * 0.01f;
+    float len = sqrtf(vx * vx + vy * vy);
+    if (len > 0.01f) {
+        float ex = L.cx + vx * L.R, ey = L.cy + vy * L.R;
+        float ux = vx / len, uy = vy / len;
+        float hl = std::min(16.0f * S, len * L.R * 0.6f);
+        D2D1_POINT_2F tip = D2D1::Point2F(ex, ey);
+        col(0.30f, 0.62f, 1.0f, 0.25f);
+        rt->DrawLine(D2D1::Point2F(L.cx, L.cy), tip, br, 11.0f * S);
+        col(0.36f, 0.68f, 1.0f);
+        rt->DrawLine(D2D1::Point2F(L.cx, L.cy), tip, br, 4.5f * S);
+        const float c30 = 0.866f, s30 = 0.5f;
+        rt->DrawLine(tip, D2D1::Point2F(ex - hl * (ux * c30 - uy * s30), ey - hl * (uy * c30 + ux * s30)), br, 4.5f * S);
+        rt->DrawLine(tip, D2D1::Point2F(ex - hl * (ux * c30 + uy * s30), ey - hl * (uy * c30 - ux * s30)), br, 4.5f * S);
+        rt->FillEllipse(D2D1::Ellipse(tip, 2.3f * S, 2.3f * S), br);
+    }
+    col(0.80f, 0.90f, 1.0f);
+    rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(L.cx, L.cy), 4.0f * S, 4.0f * S), br);
+
+    // подписи
+    wchar_t text[64];
+    if (len <= 0.01f) {
+        wcscpy_s(text, L"Штиль");
+    } else {
+        static const wchar_t* dirs[8] = {L"В", L"СВ", L"С", L"СЗ", L"З", L"ЮЗ", L"Ю", L"ЮВ"};
+        float ang = atan2f(-vy, vx);                       // 0 — восток, против часовой
+        int sector = ((int)floorf(ang / 0.785398f + 0.5f) % 8 + 8) % 8;
+        swprintf_s(text, L"%d%% · %s", (int)lroundf(std::min(1.0f, len) * 100.0f), dirs[sector]);
+    }
+    if (g_fmtBig) {
+        col(1, 1, 1);
+        rt->DrawText(text, (UINT32)wcslen(text), g_fmtBig.Get(), D2D1::RectF(0, 262 * S, L.w, 288 * S), br);
+    }
+    if (g_fmtSmall) {
+        const wchar_t* hint = L"Потяни от центра, чтобы задать ветер";
+        col(0.62f, 0.74f, 0.92f);
+        rt->DrawText(hint, (UINT32)wcslen(hint), g_fmtSmall.Get(), D2D1::RectF(0, 288 * S, L.w, 308 * S), br);
+    }
+    // кнопка «Сброс»
+    D2D1_ROUNDED_RECT btn = D2D1::RoundedRect(D2D1::RectF(L.btnL, L.btnT, L.btnR, L.btnB), 8 * S, 8 * S);
+    col(0.16f, 0.36f, 0.72f); rt->FillRoundedRectangle(btn, br);
+    if (g_fmtSmall) {
+        col(1, 1, 1);
+        rt->DrawText(L"Сброс", 5, g_fmtSmall.Get(), D2D1::RectF(L.btnL, L.btnT, L.btnR, L.btnB), br);
+    }
+    if (rt->EndDraw() == D2DERR_RECREATE_TARGET) { g_pbrush.Reset(); g_prt.Reset(); }
+}
+
+static LRESULT CALLBACK WindProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(h, &ps);
+        WindPaint(h);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_LBUTTONDOWN: {
+        WindLayout L = WindLay();
+        float x = (float)(short)LOWORD(lp), y = (float)(short)HIWORD(lp);
+        if (x >= L.btnL && x <= L.btnR && y >= L.btnT && y <= L.btnB) {
+            g_set.windX = g_set.windY = 0;
+            SaveSettings();
+        } else if (x >= L.padL && x <= L.padL + L.padSz && y >= L.padT && y <= L.padT + L.padSz) {
+            g_windDrag = true;
+            SetCapture(h);
+            WindSetFromPoint(x, y);
+        }
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (g_windDrag) {
+            WindSetFromPoint((float)(short)LOWORD(lp), (float)(short)HIWORD(lp));
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (g_windDrag) { g_windDrag = false; ReleaseCapture(); SaveSettings(); }
+        return 0;
+    case WM_CAPTURECHANGED: g_windDrag = false; return 0;
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY:
+        g_windWnd = nullptr;
+        g_windDrag = false;
+        g_pbrush.Reset(); g_prt.Reset(); g_fmtBig.Reset(); g_fmtSmall.Reset();
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static void ShowWindPanel() {
+    if (g_windWnd) { SetForegroundWindow(g_windWnd); return; }
+    WindLayout L = WindLay();
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU, ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
+    RECT rc{0, 0, (LONG)L.w, (LONG)L.h};
+    AdjustWindowRectEx(&rc, style, FALSE, ex);
+    int w = rc.right - rc.left, ht = rc.bottom - rc.top;
+    MONITORINFO mi{sizeof(mi)};
+    POINT cp; GetCursorPos(&cp);
+    GetMonitorInfoW(MonitorFromPoint(cp, MONITOR_DEFAULTTONEAREST), &mi);
+    int x = mi.rcWork.right - w - (int)(24 * L.S), y = mi.rcWork.bottom - ht - (int)(24 * L.S);
+    g_windWnd = CreateWindowExW(ex, L"SnegopadWind", L"Ветер", style, x, y, w, ht, nullptr, nullptr, g_inst, nullptr);
+    if (!g_windWnd) return;
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(g_windWnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+    ShowWindow(g_windWnd, SW_SHOW);
+    SetForegroundWindow(g_windWnd);
+}
+
+// ---------------------------------------------------------------------------
 // Значок в трее и меню
 // ---------------------------------------------------------------------------
 
@@ -1469,6 +1706,7 @@ static void ShowMenu() {
     Item(m, ID_PAUSE, L"Пауза", g_set.paused);
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)d, L"Количество снега");
+    Item(m, ID_WIND, L"Ветер…");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)mm, L"Когда окно развёрнуто на весь экран");
     Item(m, ID_GARL, L"Гирлянды на окнах", g_set.garlands);
     Item(m, ID_WIDGETS, L"Снег на виджетах Rainmeter", g_set.widgets);
@@ -1518,6 +1756,7 @@ static void ShowMenu() {
     case ID_AUTO: SetAutostart(!AutostartEnabled()); break;
     case ID_AUTOUPD: g_set.autoUpdate = !g_set.autoUpdate; break;
     case ID_CHECKUPD: StartUpdateCheck(true); break;
+    case ID_WIND: ShowWindPanel(); break;
     case ID_EXIT: g_running = false; PostQuitMessage(0); break;
     default: break;
     }
@@ -1598,6 +1837,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     wc.lpszClassName = L"SnegopadOverlay";
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassExW(&wc);
+    wc.lpfnWndProc = WindProc;
+    wc.lpszClassName = L"SnegopadWind";
+    wc.hIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(101), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+    RegisterClassExW(&wc);
 
     g_msgWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"SnegopadMsg", kTitle, WS_POPUP, 0, 0, 0, 0,
                                nullptr, nullptr, hInst, nullptr);
@@ -1653,6 +1896,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
 
     if (g_hookThreadId) PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
     if (g_hookThread) { WaitForSingleObject(g_hookThread, 1000); CloseHandle(g_hookThread); }
+    if (g_windWnd) DestroyWindow(g_windWnd);
     WTSUnRegisterSessionNotification(g_msgWnd);
     UnregisterHotKey(g_msgWnd, 1);
     RemoveTray();

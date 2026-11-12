@@ -14,4 +14,4 @@ if(MSVC)
   target_compile_options(Snegopad PRIVATE /utf-8 /W3 /permissive-)
 endif()
 target_link_libraries(Snegopad PRIVATE
-  d3d11 dxgi d2d1 dcomp dwmapi wtsapi32 winhttp shell32 user32 gdi32 advapi32)
+  d3d11 dxgi d2d1 dwrite dcomp dwmapi wtsapi32 winhttp shell32 user32 gdi32 advapi32)
