@@ -14,6 +14,7 @@
 #include <shellapi.h>
 #include <dwmapi.h>
 #include <wtsapi32.h>
+#include <winhttp.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <d2d1_1.h>
@@ -26,6 +27,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -39,6 +41,13 @@ using Microsoft::WRL::ComPtr;
 static const wchar_t* kAppName  = L"Snegopad";
 static const wchar_t* kTitle    = L"Снегопад";
 static const wchar_t* kRegKey   = L"Software\\Snegopad";
+#ifndef SNEG_VERSION
+#define SNEG_VERSION "0.0.0"
+#endif
+#define SNEG_WIDE2(x) L##x
+#define SNEG_WIDE(x) SNEG_WIDE2(x)
+static const wchar_t* kVersion  = SNEG_WIDE(SNEG_VERSION);       // подставляется при сборке релиза
+static const wchar_t* kRepoPath = L"/funmburg/snowhohoho";
 static const wchar_t* kRunKey   = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 enum : UINT {
@@ -46,11 +55,12 @@ enum : UINT {
     WM_APP_GRAB,
     WM_APP_RELEASE,
     WM_APP_HOOK,
+    WM_APP_UPDATE,      // wParam: 0 обновлений нет, 1 скачано, 2 ошибка; lParam: проверку запустили вручную
 };
 
 enum : UINT {
     ID_PAUSE = 1, ID_D0, ID_D1, ID_D2, ID_GARL, ID_BALLS, ID_PLOW, ID_PLOWNOW,
-    ID_SHAKE, ID_CLEARBALLS, ID_FPS30, ID_PFS, ID_AUTO, ID_EXIT, ID_M0, ID_M1, ID_M2, ID_WIDGETS,
+    ID_SHAKE, ID_CLEARBALLS, ID_FPS30, ID_PFS, ID_AUTO, ID_EXIT, ID_M0, ID_M1, ID_M2, ID_WIDGETS, ID_AUTOUPD, ID_CHECKUPD,
 };
 
 struct Settings {
@@ -61,6 +71,7 @@ struct Settings {
     bool fps30 = false;
     bool pauseFullscreen = true;
     bool paused = false;
+    bool autoUpdate = true;      // обновляться автоматически
     bool widgets = true;         // сугробы на виджетах Rainmeter
     int  maxMode = 1;            // развёрнутое окно: 0 обычный снег, 1 меньше, 2 без снега
 };
@@ -125,6 +136,9 @@ struct Plow {
 struct WinInfo { HWND h; RECT rc; bool surface; bool taskbar; bool widget; };
 
 static HINSTANCE g_inst;
+static HANDLE g_mutex;
+static std::atomic<bool> g_updating{false};
+static std::wstring g_newTag;
 static HWND g_overlay, g_msgWnd;
 static UINT WM_TASKBARCREATED;
 static Settings g_set;
@@ -200,6 +214,7 @@ static void LoadSettings() {
     g_set.pauseFullscreen = RegReadDword(L"PauseFullscreen", 1) != 0;
     g_set.maxMode = (int)std::min<DWORD>(2, RegReadDword(L"MaxMode", 1));
     g_set.widgets = RegReadDword(L"Widgets", 1) != 0;
+    g_set.autoUpdate = RegReadDword(L"AutoUpdate", 1) != 0;
 }
 static void SaveSettings() {
     RegWriteDword(L"Density", (DWORD)g_set.density);
@@ -210,6 +225,7 @@ static void SaveSettings() {
     RegWriteDword(L"PauseFullscreen", g_set.pauseFullscreen);
     RegWriteDword(L"MaxMode", (DWORD)g_set.maxMode);
     RegWriteDword(L"Widgets", g_set.widgets);
+    RegWriteDword(L"AutoUpdate", g_set.autoUpdate);
 }
 static bool AutostartEnabled() {
     DWORD sz = 0;
@@ -1226,6 +1242,176 @@ static DWORD WINAPI HookThread(LPVOID param) {
 }
 
 // ---------------------------------------------------------------------------
+// Обновление: новая версия берётся из релизов на GitHub
+// ---------------------------------------------------------------------------
+
+static bool ParseVersion(const wchar_t* str, int v[3]) {
+    v[0] = v[1] = v[2] = 0;
+    while (*str && (*str < L'0' || *str > L'9')) ++str;
+    return swscanf_s(str, L"%d.%d.%d", &v[0], &v[1], &v[2]) >= 1;
+}
+
+static bool IsNewer(const wchar_t* candidate, const wchar_t* current) {
+    int a[3], b[3];
+    if (!ParseVersion(candidate, a)) return false;
+    ParseVersion(current, b);
+    for (int i = 0; i < 3; ++i)
+        if (a[i] != b[i]) return a[i] > b[i];
+    return false;
+}
+
+static HINTERNET HttpSession() {
+    HINTERNET s = WinHttpOpen(L"Snegopad", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                              WINHTTP_NO_PROXY_BYPASS, 0);
+    if (s) WinHttpSetTimeouts(s, 8000, 8000, 15000, 30000);
+    return s;
+}
+
+// Адрес /releases/latest перенаправляет на /releases/tag/<версия> — оттуда и берём номер
+static bool FetchLatestTag(std::wstring& tag) {
+    bool ok = false;
+    HINTERNET s = HttpSession(), c = nullptr, r = nullptr;
+    std::wstring path = std::wstring(kRepoPath) + L"/releases/latest";
+    if (s) c = WinHttpConnect(s, L"github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (c) r = WinHttpOpenRequest(c, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
+                                  WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (r) {
+        DWORD opt = WINHTTP_DISABLE_REDIRECTS;
+        WinHttpSetOption(r, WINHTTP_OPTION_DISABLE_FEATURE, &opt, sizeof(opt));
+        if (WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+            WinHttpReceiveResponse(r, nullptr)) {
+            wchar_t loc[1024] = L"";
+            DWORD len = sizeof(loc);
+            if (WinHttpQueryHeaders(r, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, loc, &len,
+                                    WINHTTP_NO_HEADER_INDEX)) {
+                const wchar_t* t = wcsstr(loc, L"/releases/tag/");
+                if (t) {
+                    tag = t + 14;
+                    size_t cut = tag.find_first_of(L"?#/");
+                    if (cut != std::wstring::npos) tag.resize(cut);
+                    ok = !tag.empty() && tag.size() < 40;
+                }
+            }
+        }
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    return ok;
+}
+
+static bool HttpDownload(const wchar_t* path, const wchar_t* file) {
+    bool ok = false;
+    HINTERNET s = HttpSession(), c = nullptr, r = nullptr;
+    if (s) c = WinHttpConnect(s, L"github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (c) r = WinHttpOpenRequest(c, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+                                  WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(r, nullptr)) {
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                            &status, &sz, WINHTTP_NO_HEADER_INDEX);
+        if (status == 200) {
+            HANDLE f = CreateFileW(file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                std::vector<char> buf(65536);
+                DWORD total = 0;
+                bool err = false, mz = false;
+                for (;;) {
+                    DWORD n = 0, w = 0;
+                    if (!WinHttpReadData(r, buf.data(), (DWORD)buf.size(), &n)) { err = true; break; }
+                    if (!n) break;
+                    if (total == 0) mz = n >= 2 && buf[0] == 'M' && buf[1] == 'Z';
+                    if (!WriteFile(f, buf.data(), n, &w, nullptr) || w != n) { err = true; break; }
+                    total += n;
+                }
+                CloseHandle(f);
+                ok = !err && mz && total > 50000;           // похоже на настоящий .exe
+                if (!ok) DeleteFileW(file);
+            }
+        }
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    return ok;
+}
+
+static std::wstring ExePath() {
+    wchar_t exe[MAX_PATH] = L"";
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    return exe;
+}
+
+static DWORD WINAPI UpdateThread(LPVOID param) {
+    const LPARAM manual = (LPARAM)(INT_PTR)param;
+    std::wstring exe = ExePath();
+    DeleteFileW((exe + L".old").c_str());               // остаток от прошлого обновления
+    WPARAM result = 2;
+    std::wstring tag;
+    if (FetchLatestTag(tag)) {
+        if (!IsNewer(tag.c_str(), kVersion)) {
+            result = 0;
+        } else {
+            std::wstring url = std::wstring(kRepoPath) + L"/releases/download/" + tag + L"/Snegopad.exe";
+            if (HttpDownload(url.c_str(), (exe + L".new").c_str())) {
+                g_newTag = tag;
+                result = 1;
+            }
+        }
+    }
+    if (result != 1) g_updating = false;
+    PostMessageW(g_msgWnd, WM_APP_UPDATE, result, manual);
+    return 0;
+}
+
+static void StartUpdateCheck(bool manual) {
+    if (g_updating.exchange(true)) return;
+    HANDLE t = CreateThread(nullptr, 0, UpdateThread, (LPVOID)(INT_PTR)(manual ? 1 : 0), 0, nullptr);
+    if (t) CloseHandle(t); else g_updating = false;
+}
+
+// Подменяем свой .exe скачанным и перезапускаемся. Работающий файл нельзя удалить, но можно переименовать.
+static bool ApplyUpdate() {
+    std::wstring exe = ExePath(), oldf = exe + L".old", newf = exe + L".new";
+    DeleteFileW(oldf.c_str());
+    if (!MoveFileExW(exe.c_str(), oldf.c_str(), MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(newf.c_str()); return false; }
+    if (!MoveFileExW(newf.c_str(), exe.c_str(), 0)) {
+        MoveFileExW(oldf.c_str(), exe.c_str(), 0);
+        DeleteFileW(newf.c_str());
+        return false;
+    }
+    if (g_mutex) { ReleaseMutex(g_mutex); CloseHandle(g_mutex); g_mutex = nullptr; }
+    std::wstring cmd = L"\"" + exe + L"\" --updated";
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    g_running = false;
+    PostQuitMessage(0);
+    return true;
+}
+
+static void OnUpdateResult(WPARAM result, bool manual) {
+    const UINT fl = MB_OK | MB_TOPMOST | MB_SETFOREGROUND;
+    if (result == 1) {
+        if (!ApplyUpdate()) {
+            g_updating = false;
+            if (manual) MessageBoxW(nullptr, L"Новая версия скачана, но заменить файл программы не удалось.\n"
+                                             L"Переложи Snegopad.exe в папку, куда можно записывать, например в «Документы».",
+                                    kTitle, fl | MB_ICONWARNING);
+        }
+    } else if (manual) {
+        if (result == 0) MessageBoxW(nullptr, L"У тебя уже последняя версия.", kTitle, fl | MB_ICONINFORMATION);
+        else MessageBoxW(nullptr, L"Не получилось проверить обновления. Проверь интернет и попробуй позже.",
+                         kTitle, fl | MB_ICONWARNING);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Значок в трее и меню
 // ---------------------------------------------------------------------------
 
@@ -1248,6 +1434,18 @@ static void RemoveTray() {
     nid.hWnd = g_msgWnd;
     nid.uID = 1;
     Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+static void ShowBalloon(const wchar_t* text) {
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_msgWnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    wcscpy_s(nid.szInfoTitle, kTitle);
+    wcsncpy_s(nid.szInfo, text, _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 static void Item(HMENU m, UINT id, const wchar_t* text, bool checked = false) {
@@ -1285,6 +1483,11 @@ static void ShowMenu() {
     Item(m, ID_PFS, L"Пауза в играх и полноэкранном видео", g_set.pauseFullscreen);
     Item(m, ID_AUTO, L"Запускать вместе с Windows", AutostartEnabled());
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    std::wstring ver = std::wstring(L"Версия ") + (kVersion[0] == L'v' ? kVersion + 1 : kVersion);
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, ver.c_str());
+    Item(m, ID_AUTOUPD, L"Обновляться автоматически", g_set.autoUpdate);
+    Item(m, ID_CHECKUPD, L"Проверить обновления");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     Item(m, ID_EXIT, L"Выход");
 
     POINT p;
@@ -1313,6 +1516,8 @@ static void ShowMenu() {
     case ID_FPS30: g_set.fps30 = !g_set.fps30; break;
     case ID_PFS: g_set.pauseFullscreen = !g_set.pauseFullscreen; UpdateActive(); break;
     case ID_AUTO: SetAutostart(!AutostartEnabled()); break;
+    case ID_AUTOUPD: g_set.autoUpdate = !g_set.autoUpdate; break;
+    case ID_CHECKUPD: StartUpdateCheck(true); break;
     case ID_EXIT: g_running = false; PostQuitMessage(0); break;
     default: break;
     }
@@ -1344,6 +1549,7 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_APP_GRAB: OnGrab((int)(INT_PTR)wp, (int)(INT_PTR)lp); return 0;
     case WM_APP_RELEASE: OnRelease(); return 0;
+    case WM_APP_UPDATE: OnUpdateResult(wp, lp != 0); return 0;
     case WM_TIMER:
         if (wp == 1 && g_active && g_gfxOk) Frame();
         return 0;
@@ -1366,9 +1572,15 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 // Точка входа
 // ---------------------------------------------------------------------------
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
-    HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Snegopad.SingleInstance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
+    const bool updated = cmdLine && wcsstr(cmdLine, L"--updated");
+    for (int attempt = 0;; ++attempt) {                 // после обновления ждём, пока закроется старая копия
+        g_mutex = CreateMutexW(nullptr, TRUE, L"Snegopad.SingleInstance");
+        if (GetLastError() != ERROR_ALREADY_EXISTS) break;
+        if (g_mutex) { CloseHandle(g_mutex); g_mutex = nullptr; }
+        if (!updated || attempt >= 50) return 0;
+        Sleep(100);
+    }
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_inst = hInst;
@@ -1407,7 +1619,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     Reinit();
 
-    double nextState = 0, nextRetry = 0;
+    if (updated) {
+        std::wstring msg = std::wstring(L"Программа обновлена до версии ") + (kVersion[0] == L'v' ? kVersion + 1 : kVersion);
+        ShowBalloon(msg.c_str());
+    }
+    const bool releaseBuild = wcscmp(kVersion, L"0.0.0") != 0;
+    double nextState = 0, nextRetry = 0, nextUpdate = Now() + 8.0;
     while (g_running) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -1419,6 +1636,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
         double t = Now();
         if (t >= nextState) { nextState = t + 0.5; UpdateActive(); }
+        if (t >= nextUpdate) {                           // при запуске и потом раз в 6 часов
+            nextUpdate = t + 6.0 * 3600.0;
+            if (g_set.autoUpdate && releaseBuild) StartUpdateCheck(false);
+        }
 
         if (g_active && g_gfxOk) {
             double t0 = Now();
@@ -1440,6 +1661,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     G = Gfx();
     DestroyWindow(g_overlay);
     DestroyWindow(g_msgWnd);
-    if (mtx) { ReleaseMutex(mtx); CloseHandle(mtx); }
+    if (g_mutex) { ReleaseMutex(g_mutex); CloseHandle(g_mutex); }
     return 0;
 }

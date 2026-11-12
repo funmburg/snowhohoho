@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -B build -A x64
+        run: cmake -B build -A x64 "-DSNEG_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '0.0.0' }}"
       - name: Build
         run: cmake --build build --config Release
       - uses: actions/upload-artifact@v4
