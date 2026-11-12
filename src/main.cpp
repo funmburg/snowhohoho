@@ -97,7 +97,7 @@ struct Seg { float x0, x1, y; Surface* s; };
 
 struct Flake {
     float x, y, vy, amp, phase, phaseSpeed, r, alpha;
-    bool near;
+    bool close;
 };
 
 struct Particle { float x, y, vx, vy, life, maxLife, r; };
@@ -295,7 +295,7 @@ static void SpawnFlake(Flake& f, bool anywhere) {
     f.x = Frand((float)g_vx, (float)(g_vx + g_vw));
     f.y = anywhere ? Frand((float)g_vy, (float)(g_vy + g_vh)) : (float)g_vy - Frand(4.0f, 60.0f) * g_scale;
     float depth = Frand();                              // 0 далеко, 1 близко
-    f.near = depth > 0.5f;
+    f.close = depth > 0.5f;
     f.r = (0.9f + 2.1f * depth) * g_scale;
     f.vy = (34.0f + 80.0f * depth) * g_scale * Frand(0.85f, 1.15f);
     f.amp = Frand(8.0f, 26.0f) * g_scale;
@@ -788,7 +788,7 @@ static void Update(float dt) {
         f.y += f.vy * dt;
         if (f.x < vL) f.x += (float)g_vw; else if (f.x >= vR) f.x -= (float)g_vw;
         if (f.y > vB + 6.0f) { SpawnFlake(f, false); continue; }
-        if (!f.near) continue;
+        if (!f.close) continue;
         for (auto& sg : g_segs) {
             if (f.x < sg.x0 || f.x > sg.x1) continue;
             float top = sg.y - HeightAt(*sg.s, f.x);
