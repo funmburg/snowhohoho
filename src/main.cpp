@@ -50,7 +50,7 @@ enum : UINT {
 
 enum : UINT {
     ID_PAUSE = 1, ID_D0, ID_D1, ID_D2, ID_GARL, ID_BALLS, ID_PLOW, ID_PLOWNOW,
-    ID_SHAKE, ID_CLEARBALLS, ID_FPS30, ID_PFS, ID_AUTO, ID_EXIT,
+    ID_SHAKE, ID_CLEARBALLS, ID_FPS30, ID_PFS, ID_AUTO, ID_EXIT, ID_M0, ID_M1, ID_M2,
 };
 
 struct Settings {
@@ -61,6 +61,7 @@ struct Settings {
     bool fps30 = false;
     bool pauseFullscreen = true;
     bool paused = false;
+    int  maxMode = 1;            // развёрнутое окно: 0 обычный снег, 1 меньше, 2 без снега
 };
 
 // ---------------------------------------------------------------------------
@@ -96,8 +97,10 @@ struct Surface {
 struct Seg { float x0, x1, y; Surface* s; };
 
 struct Flake {
-    float x, y, vy, amp, phase, phaseSpeed, r, alpha;
-    bool close;
+    float x = 0, y = 0, vy = 0, amp = 0, phase = 0, phaseSpeed = 0, r = 1, alpha = 1;
+    float vis = 1;               // плавное скрытие над развёрнутым окном
+    bool close = false;
+    bool keep = false;           // остаётся в режиме «меньше снега»
 };
 
 struct Particle { float x, y, vx, vy, life, maxLife, r; };
@@ -143,8 +146,9 @@ static std::vector<Flake> g_flakes;
 static std::vector<Particle> g_parts;
 static std::vector<Body> g_bodies;
 static Plow g_plow;
-static float g_spawnTimer = 4.0f;
-static int g_spawnCycle = 0;
+static std::vector<RECT> g_covered;         // мониторы, занятые развёрнутым окном
+static std::vector<HMONITOR> g_coveredMon;
+static bool g_allCovered = false;
 static int g_dragIdx = -1;
 static float g_grabDx = 0, g_grabDy = 0;
 static int g_hoverIdx = -1;
@@ -191,6 +195,7 @@ static void LoadSettings() {
     g_set.plow = RegReadDword(L"Plow", 1) != 0;
     g_set.fps30 = RegReadDword(L"Fps30", 0) != 0;
     g_set.pauseFullscreen = RegReadDword(L"PauseFullscreen", 1) != 0;
+    g_set.maxMode = (int)std::min<DWORD>(2, RegReadDword(L"MaxMode", 1));
 }
 static void SaveSettings() {
     RegWriteDword(L"Density", (DWORD)g_set.density);
@@ -199,6 +204,7 @@ static void SaveSettings() {
     RegWriteDword(L"Plow", g_set.plow);
     RegWriteDword(L"Fps30", g_set.fps30);
     RegWriteDword(L"PauseFullscreen", g_set.pauseFullscreen);
+    RegWriteDword(L"MaxMode", (DWORD)g_set.maxMode);
 }
 static bool AutostartEnabled() {
     DWORD sz = 0;
@@ -310,7 +316,11 @@ static void InitFlakes() {
     int n = (int)(base[g_set.density] * area / (1920.0f * 1080.0f));
     n = std::max(40, std::min(2000, n));
     g_flakes.resize((size_t)n);
-    for (auto& f : g_flakes) SpawnFlake(f, true);
+    for (size_t i = 0; i < g_flakes.size(); ++i) {
+        SpawnFlake(g_flakes[i], true);
+        g_flakes[i].keep = (i % 4) == 0;
+        g_flakes[i].vis = 1.0f;
+    }
 }
 
 static void AddParticle(float x, float y, float vx, float vy, float life, float r) {
@@ -527,6 +537,41 @@ static bool ForegroundIsFullscreen() {
     return EqualRect(&rc, &mi.rcMonitor) != FALSE;       // игра или видео точно во весь экран
 }
 
+static BOOL CALLBACK CoveredProc(HWND h, LPARAM) {
+    if (h == g_overlay || h == g_msgWnd) return TRUE;
+    if (!IsWindowVisible(h) || IsIconic(h)) return TRUE;
+    BOOL cloaked = FALSE;
+    DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+    if (cloaked) return TRUE;
+    LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    if (ex & (WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT)) return TRUE;
+    wchar_t title[4];
+    if (InternalGetWindowText(h, title, 4) <= 0 || IsShellClass(h)) return TRUE;
+    RECT rc;
+    if (!GetWindowRect(h, &rc)) return TRUE;
+    HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(mon, &mi)) return TRUE;
+    const RECT& w = mi.rcWork;
+    bool covers = IsZoomed(h) || (rc.left <= w.left && rc.top <= w.top && rc.right >= w.right && rc.bottom >= w.bottom);
+    if (!covers) return TRUE;
+    if (std::find(g_coveredMon.begin(), g_coveredMon.end(), mon) == g_coveredMon.end()) {
+        g_coveredMon.push_back(mon);
+        g_covered.push_back(mi.rcMonitor);
+    }
+    return TRUE;
+}
+
+// На каких мониторах окно развёрнуто на весь экран (рабочего стола там не видно)
+static void ScanCovered() {
+    g_covered.clear();
+    g_coveredMon.clear();
+    g_allCovered = false;
+    if (g_set.maxMode == 0) return;
+    EnumWindows(CoveredProc, 0);
+    g_allCovered = !g_covered.empty() && (int)g_covered.size() >= GetSystemMetrics(SM_CMONITORS);
+}
+
 // ---------------------------------------------------------------------------
 // Снежки, снеговики
 // ---------------------------------------------------------------------------
@@ -576,27 +621,19 @@ static void DropDrag() {
     g_dragging = false;
 }
 
-static void SpawnBall() {
-    static const float sizes[3] = {22.0f, 17.0f, 12.5f};
-    Seg* best = nullptr;
-    for (auto& sg : g_segs)
-        if (sg.s->taskbar && (!best || sg.x1 - sg.x0 > best->x1 - best->x0)) best = &sg;
-    Body b;
-    float r = sizes[g_spawnCycle++ % 3] * g_scale;
-    if (best) {
-        float m = std::min(60.0f * g_scale, (best->x1 - best->x0) * 0.2f);
-        b.x = Frand(best->x0 + m, best->x1 - m);
-        b.base = best->y;
-    } else {
-        MONITORINFO mi{sizeof(mi)};
-        POINT zero{0, 0};
-        GetMonitorInfoW(MonitorFromPoint(zero, MONITOR_DEFAULTTOPRIMARY), &mi);
-        b.x = Frand((float)mi.rcWork.left + 80.0f * g_scale, (float)mi.rcWork.right - 80.0f * g_scale);
-        b.base = (float)mi.rcWork.bottom;
+// Курсор над сугробом? pad > 0 — «рядом с сугробом» (чтобы заранее включить перехват мыши)
+static bool SnowHit(float px, float py, float pad) {
+    for (auto& sg : g_segs) {
+        if (px < sg.x0 - pad || px > sg.x1 + pad) continue;
+        float h = HeightAt(*sg.s, Clampf(px, sg.x0, sg.x1));
+        if (pad <= 0 && h < 4.0f * g_scale) continue;
+        float top = sg.y - (pad > 0 ? MaxHeight(*sg.s) : h);
+        if (py >= top - 2.0f * g_scale - pad && py <= sg.y + 1.0f + pad) return true;
     }
-    b.radii.push_back(r);
-    g_bodies.push_back(b);
+    return false;
 }
+
+static const size_t kMaxBodies = 12;
 
 static void UpdateBodies(float dt) {
     POINT cp{};
@@ -607,15 +644,6 @@ static void UpdateBodies(float dt) {
         g_hot = false; g_hoverIdx = -1;
         SetHook(false);
         return;
-    }
-
-    // появление новых снежков
-    int singles = 0;
-    for (auto& b : g_bodies) if (b.radii.size() == 1) ++singles;
-    g_spawnTimer -= dt;
-    if (g_spawnTimer <= 0) {
-        g_spawnTimer = 12.0f;
-        if (singles < 3 && g_bodies.size() < 8) SpawnBall();
     }
 
     const float grav = 1900.0f * g_scale;
@@ -632,6 +660,27 @@ static void UpdateBodies(float dt) {
             b.vx += (ivx - b.vx) * 0.35f;
             b.vy += (ivy - b.vy) * 0.35f;
             b.x = nx; b.base = ny;
+            // снежок катят по сугробу — он собирает снег и растёт
+            if (b.radii.size() == 1) {
+                float& r = b.radii[0];
+                const float rmax = 26.0f * g_scale;
+                for (auto& sg : g_segs) {
+                    if (r >= rmax) break;
+                    if (fabsf(b.base - sg.y) > 14.0f * g_scale) continue;
+                    float xa = std::max(b.x - r, sg.x0), xb = std::min(b.x + r, sg.x1);
+                    if (xa >= xb) continue;
+                    Surface& sf = *sg.s;
+                    int n = (int)sf.h.size();
+                    int c0 = std::max(0, (int)((xa - (float)sf.rc.left) / g_cw));
+                    int c1 = std::min(n - 1, (int)((xb - (float)sf.rc.left) / g_cw));
+                    float sum = 0;
+                    for (int c = c0; c <= c1; ++c) { sum += sf.h[(size_t)c]; sf.h[(size_t)c] = 0; }
+                    if (sum > 0) {
+                        sf.dirty = true;
+                        r = std::min(rmax, sqrtf(r * r + sum * g_cw * 1.1f / 3.14159f));
+                    }
+                }
+            }
             continue;
         }
 
@@ -685,14 +734,28 @@ static void UpdateBodies(float dt) {
 
     // наведение мыши: перехват кликов включаем только рядом со снежком
     g_hoverIdx = g_dragIdx >= 0 ? g_dragIdx : HitBody((float)cp.x, (float)cp.y, 2.0f * g_scale);
-    g_hot = g_dragIdx < 0 && g_hoverIdx >= 0;
-    bool nearBall = g_dragIdx >= 0 || g_dragging.load() || HitBody((float)cp.x, (float)cp.y, 40.0f * g_scale) >= 0;
+    bool canRoll = g_bodies.size() < kMaxBodies;
+    g_hot = g_dragIdx < 0 && (g_hoverIdx >= 0 || (canRoll && SnowHit((float)cp.x, (float)cp.y, 0.0f)));
+    bool nearBall = g_dragIdx >= 0 || g_dragging.load() || HitBody((float)cp.x, (float)cp.y, 40.0f * g_scale) >= 0 ||
+                    (canRoll && SnowHit((float)cp.x, (float)cp.y, 24.0f * g_scale));
     SetHook(nearBall);
 }
 
 static void OnGrab(int px, int py) {
+    if (!g_active || !g_set.balls) { g_dragging = false; return; }
     int i = HitBody((float)px, (float)py, 3.0f * g_scale);
-    if (i < 0 || !g_active) { g_dragging = false; return; }
+    if (i < 0) {
+        // клик по сугробу — начинаем катать новый снежок
+        if (g_bodies.size() >= kMaxBodies || !SnowHit((float)px, (float)py, 0.0f)) { g_dragging = false; return; }
+        Body nb;
+        float r0 = 7.0f * g_scale;
+        nb.x = (float)px;
+        nb.base = (float)py + r0;
+        nb.appear = 1.0f;
+        nb.radii.push_back(r0);
+        g_bodies.push_back(nb);
+        i = (int)g_bodies.size() - 1;
+    }
     g_dragIdx = i;
     Body& b = g_bodies[(size_t)i];
     g_grabDx = (float)px - b.x;
@@ -706,6 +769,10 @@ static void OnRelease() {
         const float lim = 2600.0f * g_scale;
         b.vx = Clampf(b.vx, -lim, lim);
         b.vy = Clampf(b.vy, -lim, lim);
+        if (b.radii.size() == 1 && b.radii[0] < 10.0f * g_scale) {      // слишком маленький комок рассыпается
+            Poof(b.x, b.base - b.radii[0], 8, 0.6f);
+            g_bodies.erase(g_bodies.begin() + g_dragIdx);
+        }
     }
     g_dragIdx = -1;
 }
@@ -788,7 +855,16 @@ static void Update(float dt) {
         f.y += f.vy * dt;
         if (f.x < vL) f.x += (float)g_vw; else if (f.x >= vR) f.x -= (float)g_vw;
         if (f.y > vB + 6.0f) { SpawnFlake(f, false); continue; }
-        if (!f.close) continue;
+        float target = 1.0f;
+        if (g_set.maxMode != 0 && !g_covered.empty()) {
+            for (auto& rc : g_covered)
+                if (f.x >= (float)rc.left && f.x < (float)rc.right && f.y >= (float)rc.top && f.y < (float)rc.bottom) {
+                    target = (g_set.maxMode == 1 && f.keep) ? 1.0f : 0.0f;
+                    break;
+                }
+        }
+        if (f.vis != target) f.vis = Clampf(f.vis + (target > f.vis ? 2.5f : -2.5f) * dt, 0.0f, 1.0f);
+        if (!f.close || f.vis < 0.5f) continue;
         for (auto& sg : g_segs) {
             if (f.x < sg.x0 || f.x > sg.x1) continue;
             float top = sg.y - HeightAt(*sg.s, f.x);
@@ -966,7 +1042,8 @@ static void Render() {
         FillCircle(p.x, p.y, p.r);
     }
     for (auto& f : g_flakes) {
-        Col(1, 1, 1, f.alpha);
+        if (f.vis < 0.02f) continue;
+        Col(1, 1, 1, f.alpha * f.vis);
         FillCircle(f.x, f.y, f.r);
     }
 
@@ -1025,7 +1102,9 @@ static void Frame() {
 }
 
 static void UpdateActive() {
-    bool want = !g_set.paused && !g_locked && !(g_set.pauseFullscreen && ForegroundIsFullscreen());
+    ScanCovered();
+    bool want = !g_set.paused && !g_locked && !(g_set.pauseFullscreen && ForegroundIsFullscreen()) &&
+                !(g_set.maxMode == 2 && g_allCovered);      // «без снега»: ничего не рисуем вовсе
     if (want == g_active) return;
     g_active = want;
     if (want) {
@@ -1117,11 +1196,18 @@ static void ShowMenu() {
     Item(d, ID_D2, L"Много", g_set.density == 2);
     CheckMenuRadioItem(d, ID_D0, ID_D2, ID_D0 + (UINT)g_set.density, MF_BYCOMMAND);
 
+    HMENU mm = CreatePopupMenu();
+    Item(mm, ID_M0, L"Обычный снег", g_set.maxMode == 0);
+    Item(mm, ID_M1, L"Меньше снега", g_set.maxMode == 1);
+    Item(mm, ID_M2, L"Без снега (только на рабочем столе и с небольшими окнами)", g_set.maxMode == 2);
+    CheckMenuRadioItem(mm, ID_M0, ID_M2, ID_M0 + (UINT)g_set.maxMode, MF_BYCOMMAND);
+
     Item(m, ID_PAUSE, L"Пауза", g_set.paused);
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_POPUP, (UINT_PTR)d, L"Количество снега");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mm, L"Когда окно развёрнуто на весь экран");
     Item(m, ID_GARL, L"Гирлянды на окнах", g_set.garlands);
-    Item(m, ID_BALLS, L"Снежки и снеговики", g_set.balls);
+    Item(m, ID_BALLS, L"Снежки: катать мышкой из сугроба", g_set.balls);
     Item(m, ID_PLOW, L"Снегоуборщик", g_set.plow);
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     Item(m, ID_PLOWNOW, L"Вызвать снегоуборщик");
@@ -1147,13 +1233,14 @@ static void ShowMenu() {
     case ID_PAUSE: g_set.paused = !g_set.paused; UpdateActive(); break;
     case ID_D0: case ID_D1: case ID_D2: g_set.density = (int)(cmd - ID_D0); InitFlakes(); break;
     case ID_GARL: g_set.garlands = !g_set.garlands; break;
-    case ID_BALLS: g_set.balls = !g_set.balls; g_spawnTimer = 2.0f; break;
+    case ID_BALLS: g_set.balls = !g_set.balls; break;
+    case ID_M0: case ID_M1: case ID_M2: g_set.maxMode = (int)(cmd - ID_M0); UpdateActive(); break;
     case ID_PLOW: g_set.plow = !g_set.plow; break;
     case ID_PLOWNOW: StartPlow(); break;
     case ID_SHAKE: for (auto& kv : g_surf) Shed(kv.second); break;
     case ID_CLEARBALLS:
         for (auto& b : g_bodies) Poof(b.x, b.base - BodyHeight(b) * 0.5f, 10, 1.0f);
-        g_bodies.clear(); DropDrag(); g_spawnTimer = 6.0f;
+        g_bodies.clear(); DropDrag();
         break;
     case ID_FPS30: g_set.fps30 = !g_set.fps30; break;
     case ID_PFS: g_set.pauseFullscreen = !g_set.pauseFullscreen; UpdateActive(); break;
